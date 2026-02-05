@@ -25,8 +25,8 @@ app = FastAPI(
 # -------------------------
 # CONFIGURATION
 # -------------------------
-MAX_MESSAGES = 20
-MIN_INTEL_REQUIRED = 3
+MAX_MESSAGES = 15
+MIN_INTEL_REQUIRED = 2
 
 # -------------------------
 # DATABASE MANAGER (Persistence)
@@ -331,7 +331,10 @@ async def send_final_callback(session: SessionData):
         print(f"[CALLBACK SENT] {session.session_id} | Reason: {reason}")
 
     except Exception as e:
-        print(f"[CALLBACK FAILED] {session.session_id}: {e}")
+        # FIX 3: HARDENED LOGGING
+        print("[CALLBACK FAILED]")
+        print("Session:", session.session_id)
+        print("Error:", repr(e))
 
 # -------------------------
 # LLM CLIENT (HARDENED)
@@ -457,6 +460,12 @@ async def honeypot(
     if should_exit and not current_session.callback_sent:
         print(f"[EXIT TRIGGER] Session {session_id} stopping due to: {exit_reason}")
         current_session.exit_reason = exit_reason
+        await send_final_callback(current_session)
+    
+    # FIX 4: Safety Net for Forced Exit (Dead Switch)
+    if current_session.message_count >= MAX_MESSAGES and not current_session.callback_sent:
+        print(f"[FORCED EXIT] Session {session_id} hit max messages without previous trigger.")
+        current_session.exit_reason = "FORCED_EXIT"
         await send_final_callback(current_session)
 
     # PHASE 9: POST-CALLBACK RESPONSE

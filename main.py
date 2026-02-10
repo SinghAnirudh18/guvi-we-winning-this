@@ -4,13 +4,13 @@ import random
 import re
 import httpx 
 import sqlite3 
+import joblib
+import numpy as np
 from fastapi import FastAPI, Header, HTTPException, Request
 from dotenv import load_dotenv
 from typing import Optional, Dict, List, Tuple
 from pydantic import BaseModel, Field
 import uvicorn
-import joblib
-
 
 # Load environment variables
 load_dotenv()
@@ -81,7 +81,6 @@ class DatabaseManager:
         return None
 
 DB_PATH = os.getenv("DB_PATH", "honeypot.db")
-
 DB = DatabaseManager(db_name=DB_PATH)
 
 # -------------------------
@@ -112,7 +111,6 @@ FALLBACK_RESPONSES = [
     "I am typing the number but it won't submit. Do you have a QR code?"
 ]
 
-# FIX 1: New Role-Aware Sanitizer
 IMPERATIVE_PATTERNS = [
     r"\b(send|share|provide|enter|pay)\b\s+(your|the)",
     r"\bclick\b\s+(the|on)",
@@ -120,9 +118,7 @@ IMPERATIVE_PATTERNS = [
 ]
 
 def sanitize_reply(reply: str) -> str:
-    """
-    Blocks the LLM if it tries to give INSTRUCTIONS (Imperatives).
-    """
+    """Blocks the LLM if it tries to give INSTRUCTIONS (Imperatives)."""
     lower = reply.lower()
     for pattern in IMPERATIVE_PATTERNS:
         if re.search(pattern, lower):
@@ -145,8 +141,7 @@ PERSONAS = {
         "3. Ask for clarification.\n"
         "EXAMPLES:\n"
         "- 'I am typing the OTP but the submit button is grey. What do I do now?'\n"
-        "- 'It says invalid format. Do I put spaces between the numbers?'\n"
-        "NEGATIVE CONSTRAINT: Never say 'I am doing it'. Say 'I am trying, but...?'"
+        "- 'It says invalid format. Do you want me to use my son's phone?'\n"
     ),
     "panicked_youth": (
         "SYSTEM_INSTRUCTION:\n"
@@ -158,7 +153,7 @@ PERSONAS = {
         "2. Ask for a different method.\n"
         "EXAMPLES:\n"
         "- 'Bro my Gpay is loading forever. Do you have Paytm?'\n"
-        "- 'It failed again. Is the server down?'\n"
+        "- 'It failed again. Is the server down or is it my wifi?'\n"
     ),
     "skeptical_shopkeeper": (
         "SYSTEM_INSTRUCTION:\n"
@@ -175,9 +170,9 @@ PERSONAS = {
 }
 
 # -------------------------
-# ML MODEL WRAPPER
+# ML MODEL WRAPPER (INTEGRATED)
 # -------------------------
-ML_THRESHOLD = 0.3
+ML_THRESHOLD = 0.65  # Confidence required to flag as Scam
 SCAM_KEYWORDS = {
     "block", "suspend", "verify", "pan", "kyc", "update", 
     "expire", "alert", "transaction", "debit", "credit", 
@@ -192,46 +187,69 @@ class SpamClassifier:
         self.vectorizer = None
         self.is_loaded = False
         
-        # TODO: UNCOMMENT THE BELOW BLOCK WHEN YOUR MODEL IS READY
+        # FIX: Get the absolute path to the directory where main.py lives
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        model_path = os.path.join(base_dir, "model.pkl")
+        vectorizer_path = os.path.join(base_dir, "vectorizer.pkl")
+
+        print(f"[SYSTEM] Loading ML artifacts from: {base_dir}")
+
         try:
-            # Ensure these files exist in your root directory
-            self.model = joblib.load("model.pkl")
-            self.vectorizer = joblib.load("vectorizer.pkl")
-            self.is_loaded = True
-            print("[SYSTEM] ML Model Loaded Successfully via Joblib")
+            if os.path.exists(model_path) and os.path.exists(vectorizer_path):
+                self.model = joblib.load(model_path)
+                self.vectorizer = joblib.load(vectorizer_path)
+                self.is_loaded = True
+                print("✅ ML Model & Vectorizer Loaded Successfully")
+            else:
+                print(f"❌ ERROR: Artifacts not found at {base_dir}")
+                print("HINT: Are model.pkl and vectorizer.pkl in this folder?")
         except Exception as e:
-            # Silent failure is okay here, we fall back to rules
-            pass
+            print(f"❌ ERROR Loading ML Model: {e}")
+
+    def _preprocess(self, text: str) -> str:
+        """Mirror of Training Preprocessing."""
+        if not isinstance(text, str):
+            text = str(text)
+        text = text[:3000].lower()
+        text = re.sub(r'https?://\S+|www\.\S+', ' <url> ', text)
+        text = re.sub(r'\s+', ' ', text).strip()
+        return text
 
     def predict_proba(self, text: str) -> float:
-        """
-        Returns probability of scam (0.0 to 1.0).
-        """
         if not self.is_loaded:
             return 0.0
         
         try:
-            # TODO: UNCOMMENT WHEN MODEL IS READY
-            vector = self.vectorizer.transform([text])
+            clean_text = self._preprocess(text)
+            vector = self.vectorizer.transform([clean_text])
             proba = self.model.predict_proba(vector)[0][1]
-            return proba
-            return 0.0 
-        except Exception:
+            return float(proba)
+        except Exception as e:
+            print(f"[ML ERROR] Prediction failed: {e}")
             return 0.0
-        
+
 SCAM_CLASSIFIER = SpamClassifier()
 
 def detect_scam_hybrid(text: str) -> bool:
+    """
+    Combines ML Score + Keyword Matching
+    """
     text_lower = text.lower()
+    
+    # 1. Get ML Score
     ml_score = SCAM_CLASSIFIER.predict_proba(text)
-    ml_flag = ml_score >= ML_THRESHOLD
-    rule_flag = False
+    
+    # 2. Check Keywords (Fallback)
+    keyword_flag = False
     for word in SCAM_KEYWORDS:
         if word in text_lower:
-            rule_flag = True
+            keyword_flag = True
             break
-    print(f"[ANALYSIS] Text: '{text[:30]}...' | ML: {ml_score} | KEYWORD: {rule_flag}")
-    return ml_flag or rule_flag
+            
+    is_scam = (ml_score >= ML_THRESHOLD) or keyword_flag
+    
+    print(f"[ANALYSIS] Text: '{text[:30]}...' | ML Score: {ml_score:.4f} | Keyword Match: {keyword_flag} | DETECTED: {is_scam}")
+    return is_scam
 
 # -------------------------
 # SESSION MODEL
@@ -320,6 +338,7 @@ async def send_final_callback(session: SessionData):
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
+            # TODO: Replace with your actual hackathon/production endpoint
             response = await client.post(
                 "https://hackathon.guvi.in/api/updateHoneyPotFinalResult",
                 json=payload
@@ -331,7 +350,6 @@ async def send_final_callback(session: SessionData):
         print(f"[CALLBACK SENT] {session.session_id} | Reason: {reason}")
 
     except Exception as e:
-        # FIX 3: HARDENED LOGGING
         print("[CALLBACK FAILED]")
         print("Session:", session.session_id)
         print("Error:", repr(e))
@@ -397,7 +415,7 @@ def validate_api_key(x_api_key: Optional[str]):
 def health():
     try:
         count = DB.conn.execute("SELECT count(*) FROM sessions").fetchone()[0]
-        return { "status": "ok", "persisted_sessions": count }
+        return { "status": "ok", "persisted_sessions": count, "ml_ready": SCAM_CLASSIFIER.is_loaded }
     except:
         return { "status": "error", "persisted_sessions": 0 }
 
@@ -441,13 +459,16 @@ async def honeypot(
         current_session.message_count += 1
 
     # PHASE 9: STOP EXTRACTION IF CALLBACK SENT
-    # This prevents wasting regex compute on a closed case
     if text and not current_session.callback_sent:
         run_detective(text, current_session.extracted_intel)
 
+    # ----------------------------------------------------
+    # SCAM DETECTION LOGIC (ML + Hybrid)
+    # ----------------------------------------------------
     if not current_session.scam_detected:
         if detect_scam_hybrid(text):
             current_session.scam_detected = True
+            print(f"[SCAM DETECTED] Session {session_id} flagged as MALICIOUS.")
 
     if current_session.scam_detected and not current_session.persona:
         persona_key = random.choice(list(PERSONAS.keys()))
@@ -462,20 +483,24 @@ async def honeypot(
         current_session.exit_reason = exit_reason
         await send_final_callback(current_session)
     
-    # FIX 4: Safety Net for Forced Exit (Dead Switch)
+    # Safety Net for Forced Exit
     if current_session.message_count >= MAX_MESSAGES and not current_session.callback_sent:
-        print(f"[FORCED EXIT] Session {session_id} hit max messages without previous trigger.")
+        print(f"[FORCED EXIT] Session {session_id} hit max messages.")
         current_session.exit_reason = "FORCED_EXIT"
         await send_final_callback(current_session)
 
-    # PHASE 9: POST-CALLBACK RESPONSE
+    # ----------------------------------------------------
+    # RESPONSE GENERATION
+    # ----------------------------------------------------
     if current_session.callback_sent:
-        # Polite, static, resource-efficient response
+        # Polite, static, resource-efficient response for closed sessions
         reply = "I have noted this, please wait."
     elif current_session.scam_detected:
+        # If scam detected, use the persona to waste their time
         system_prompt = PERSONAS.get(current_session.persona, PERSONAS["retired_citizen"])
         reply = await call_llm(system_prompt, current_session.conversation_history)
     else:
+        # If unsure (low prob), act confused but don't commit to a persona yet
         reply = "I'm not sure I understand. Could you explain?"
 
     current_session.conversation_history.append({
